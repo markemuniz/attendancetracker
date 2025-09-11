@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Attendance Viewer — Refresh Names From Upload</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <style>
+    .clickable { cursor: pointer; }
+    .badge { padding: 0.125rem 0.5rem; border-radius: 9999px; border: 1px solid #e5e7eb; }
+    .tooltip { display:none; position:absolute; background:white; border:1px solid #e5e7eb; padding:0.5rem; border-radius:0.5rem; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); z-index: 10; }
+    .cell-rel { position:relative; }
+    .muted { color:#6b7280; }
+  </style>
+</head>
+<body class="min-h-screen bg-gray-50 text-gray-900">
+  <div class="max-w-6xl mx-auto p-6">
+    <header class="mb-6">
+      <h1 class="text-2xl font-bold">Attendance Viewer — Lates & Call Outs</h1>
+      <p class="text-sm text-gray-600">
+        Upload your workbook, then pick a name and date. Names auto-refresh from the upload (visible rows only on matrix-style sheets).
+        Hours show only when explicitly written in a comment (no minute→hour conversion).
+      </p>
+    </header>
+
+    <section class="bg-white rounded-2xl shadow p-5 mb-6">
+      <label class="block text-sm font-medium mb-2">Upload Excel (.xlsx)</label>
+      <input type="file" id="fileInput" accept=".xlsx,.xls" class="block w-full text-sm text-gray-700 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-gray-100 hover:file:bg-gray-200" />
+      <div id="loadMsg" class="text-sm text-amber-700 mt-3"></div>
+      <div id="rosterMsg" class="text-xs text-gray-600 mt-1"></div>
+    </section>
+
+    <section class="bg-white rounded-2xl shadow p-5 mb-6 grid gap-4 md:grid-cols-4">
+      <div>
+        <label class="block text-sm font-medium mb-2">Employee</label>
+        <select id="nameSelect" class="w-full border rounded-lg p-2.5 text-sm"></select>
+      </div>
+      <div>
+        <label class="block text-sm font-medium mb-2">Start Date (last 60 days)</label>
+        <select id="dateSelect" class="w-full border rounded-lg p-2.5 text-sm"></select>
+      </div>
+      <div>
+        <label class="block text-sm font-medium mb-2">Show</label>
+        <select id="typeSelect" class="w-full border rounded-lg p-2.5 text-sm">
+          <option value="both" selected>Late + Call Out</option>
+          <option value="late">Late only</option>
+          <option value="callout">Call Out only</option>
+        </select>
+      </div>
+      <div class="flex items-end gap-2">
+        <button id="runBtn" class="w-full md:w-auto px-4 py-2 bg-black text-white rounded-lg text-sm font-semibold">Show Entries</button>
+        <button id="refreshNamesBtn" class="w-full md:w-auto px-4 py-2 bg-gray-200 rounded-lg text-sm">Refresh Names From File</button>
+      </div>
+    </section>
+
+    <section id="results" class="bg-white rounded-2xl shadow p-5">
+      <div id="summary" class="text-sm text-gray-700 mb-4"></div>
+      <div class="overflow-x-auto">
+        <table class="min-w-full divide-y divide-gray-200 text-sm">
+          <thead class="bg-gray-50">
+            <tr>
+              <th class="px-3 py-2 text-left font-semibold">Date</th>
+              <th class="px-3 py-2 text-left font-semibold">Employee</th>
+              <th class="px-3 py-2 text-left font-semibold">Type</th>
+              <th class="px-3 py-2 text-left font-semibold">Details</th>
+              <th class="px-3 py-2 text-left font-semibold">Late (mins)</th>
+              <th class="px-3 py-2 text-left font-semibold">Late (hrs)</th>
+            </tr>
+          </thead>
+          <tbody id="tbody" class="divide-y divide-gray-100"></tbody>
+        </table>
+      </div>
+      <div id="scanInfo" class="text-xs muted mt-3"></div>
+    </section>
+  </div>
+
+  <script>
+    // ---------- Roster helpers ----------
+    const embeddedNames = []; // start empty; will populate from upload
+    const canon = s => String(s||'').trim().replace(/\s+/g,' ').toLowerCase();
+
+    function buildNameDropdown(names, preserveSelection=true) {
+      const sel = document.getElementById('nameSelect');
+      const previous = sel.value || '';
+      sel.innerHTML = '<option value="" disabled selected>— Select a name —</option>';
+      names.sort((a,b)=>a.localeCompare(b)).forEach(n => {
+        const opt = document.createElement('option');
+        opt.value = n;
+        opt.textContent = n;
+        sel.appendChild(opt);
+      });
+      if (preserveSelection) {
+        const found = names.find(n => canon(n) === canon(previous));
+        if (found) sel.value = found;
+      }
+    }
+    buildNameDropdown(embeddedNames, false);
+
+    function setRosterMsg(msg){ document.getElementById('rosterMsg').textContent = msg || ''; }
+
+    // ---------- Date dropdown (last 60 days) ----------
+    function fmtDate(d){const y=d.getFullYear(),m=(d.getMonth()+1+'').padStart(2,'0'),dd=(d.getDate()+'').padStart(2,'0');return `${y}-${m}-${dd}`;}
+    function buildDateDropdown(){
+      const sel=document.getElementById('dateSelect'); sel.innerHTML='';
+      const today=new Date();
+      for(let i=0;i<60;i++){const d=new Date(today); d.setDate(today.getDate()-i);
+        const o=document.createElement('option'); o.value=fmtDate(d); o.textContent=d.toLocaleDateString(); sel.appendChild(o);}
+    }
+    buildDateDropdown();
+
+    // ---------- General helpers ----------
+    function parseExcelDate(v){ if(typeof v==='number'){const d=new Date(Math.round((v-25569)*86400*1000)); return new Date(d.getFullYear(), d.getMonth(), d.getDate());}
+      const d=new Date(v); if(!isNaN(d)) return new Date(d.getFullYear(), d.getMonth(), d.getDate()); return null; }
+    function normalizeHeader(h){ return String(h||'').trim().toLowerCase(); }
+    function showLoadMsg(msg, err=false){ const el=document.getElementById('loadMsg'); el.textContent=msg; el.className='text-sm mt-3 '+(err?'text-red-700':'text-amber-700'); }
+
+    // ---------- Column detection for log-mode ----------
+    const dateKeys = ['date','shift date','work date','day'];
+    const nameKeys = ['name','employee','team member','associate','first name','last name'];
+    const statusKeys=['status','note','attendance','type','reason','remark','incident'];
+    const minutesKeys=['late (mins)','late mins','late minutes','minutes late','mins late','late min','late_minutes','mins'];
+    const hoursKeys=['late (hrs)','late hours','hours late','hrs late','late_hrs','hrs'];
+
+    function detectColumns(headers){
+      const norm=headers.map(normalizeHeader);
+      const find=(cands)=>{ for(const k of cands){const i=norm.indexOf(k); if(i!==-1) return i;}
+        for(let i=0;i<norm.length;i++){ for(const k of cands){ if(norm[i].includes(k)) return i; } } return -1; };
+      return { dateIdx:find(dateKeys), firstIdx:norm.indexOf('first name'), lastIdx:norm.indexOf('last name'),
+               nameIdx:find(nameKeys), statusIdx:find(statusKeys), minutesIdx:find(minutesKeys), hoursIdx:find(hoursKeys) };
+    }
+
+    // ---------- Keywords ----------
+    const lateKeys=['late','tardy'];
+    const calloutKeys=['call out','callout','call-out','ncns','no call no show','absence','absent','called out','call off','call-off','co'];
+
+    function classifyType(text){ const s=(text||'').toLowerCase();
+      if(s==='late' || lateKeys.some(k=>s.includes(k))) return 'Late';
+      if(s==='call out' || s==='callout' || s==='ncns' || s==='co' || calloutKeys.some(k=>s.includes(k))) return 'Call Out';
+      return '';
+    }
+
+    // ---------- Durations parsing ----------
+    // Only mark hrs when explicitly present; do not convert mins to hours.
+    function parseDurations(text){
+      let mins=null, hrs=null, hrsExplicit=false;
+      const hrMatch = text.match(/(\d+(?:\.\d+)?)\s*(?:hour|hr|hrs|hours)\b/i);
+      const minMatch = text.match(/(\d+)\s*(?:min|mins|minutes)\b/i);
+      if (hrMatch) { hrs = parseFloat(hrMatch[1]); hrsExplicit = true; }
+      if (minMatch) { mins = parseInt(minMatch[1], 10); }
+      return {mins, hrs, hrsExplicit};
+    }
+
+    // ---------- Global rows ----------
+    let allRows=[];
+    let lastWorkbook=null;
+
+    // ---------- Read workbook ----------
+    function readWorkbook(wb){
+      allRows=[];
+      lastWorkbook = wb;
+      let total=0, matrix=0, log=0;
+      const scanned=[];
+
+      wb.SheetNames.forEach(sheetName=>{
+        const ws=wb.Sheets[sheetName];
+        if(!ws) return;
+        scanned.push(sheetName);
+
+        // 1) LOG MODE
+        const json=XLSX.utils.sheet_to_json(ws,{header:1,raw:true});
+        if(json && json.length){
+          const headers=json[0];
+          const col=detectColumns(headers);
+          if(col.dateIdx!==-1 && (col.nameIdx!==-1 || (col.firstIdx!==-1 && col.lastIdx!==-1)) && col.statusIdx!==-1){
+            for(let r=1;r<json.length;r++){
+              const row=json[r];
+              const dateVal=row[col.dateIdx];
+              let nameVal=row[col.nameIdx];
+              if((!nameVal || String(nameVal).trim()==='') && col.firstIdx!==-1 && col.lastIdx!==-1){
+                const fn=row[col.firstIdx]||''; const ln=row[col.lastIdx]||''; nameVal=`${fn} ${ln}`.trim();
+              }
+              const statusVal=row[col.statusIdx];
+              const minsVal=row[col.minutesIdx]; const hrsVal=row[col.hoursIdx];
+              const d=parseExcelDate(dateVal); const nm=nameVal?String(nameVal).trim():''; const status=statusVal?String(statusVal).trim():'';
+              const typ=classifyType(status);
+              if(!d || !nm || !typ) continue;
+              let hrsExplicit = (hrsVal!==undefined && hrsVal!=='' && hrsVal!=null);
+              allRows.push({date:d,name:nm,type:typ,status,mins:(minsVal!==undefined&&minsVal!=='')?Number(minsVal):null,
+                            hrs:(hrsVal!==undefined&&hrsVal!=='')?Number(hrsVal):null, hrsExplicit});
+              total++; log++;
+            }
+          }
+        }
+
+        // 2) MATRIX MODE (First/Last + dates), honoring hidden rows if provided
+        const ref = ws['!ref'];
+        if (!ref) return;
+        const range = XLSX.utils.decode_range(ref);
+        const headerRow = range.s.r;
+        const h0Cell = ws[XLSX.utils.encode_cell({r: headerRow, c: 0})];
+        const h1Cell = ws[XLSX.utils.encode_cell({r: headerRow, c: 1})];
+        const h0 = h0Cell ? String(h0Cell.v||'').toLowerCase() : '';
+        const h1 = h1Cell ? String(h1Cell.v||'').toLowerCase() : '';
+
+        if( (h0.includes('first') && h1.includes('last')) ){
+          for(let c=2;c<=range.e.c;c++){
+            const headCell = ws[XLSX.utils.encode_cell({r: headerRow, c})];
+            if(!headCell) continue;
+            const d = parseExcelDate(headCell.v);
+            if(!d) continue;
+            for(let r=headerRow+1; r<=range.e.r; r++){
+              const rowsMeta = ws['!rows'] || [];
+              const rowMeta = rowsMeta[r] || {};
+              if (rowMeta && rowMeta.hidden) continue;
+
+              const fnCell = ws[XLSX.utils.encode_cell({r, c:0})];
+              const lnCell = ws[XLSX.utils.encode_cell({r, c:1})];
+              const nm = `${(fnCell&&fnCell.v)||''} ${(lnCell&&lnCell.v)||''}`.trim();
+              if(!nm) continue;
+              const addr = XLSX.utils.encode_cell({r, c});
+              const cell = ws[addr];
+              if(!cell || cell.v==null || cell.v==='') continue;
+              const txt = String(cell.v).trim();
+              const typ = classifyType(txt);
+              if(!typ) continue;
+              let mins=null, hrs=null, hrsExplicit=false;
+              if (cell.c && cell.c.length){
+                const commentText = cell.c.map(x => (x.t||'')).join(' ');
+                const durs = parseDurations(commentText);
+                mins=durs.mins; hrs=durs.hrs; hrsExplicit=durs.hrsExplicit;
+              } else {
+                const durs = parseDurations(txt);
+                mins=durs.mins; hrs=durs.hrs; hrsExplicit=durs.hrsExplicit;
+              }
+              allRows.push({date:d,name:nm,type:typ,status:txt,mins,hrs,hrsExplicit});
+              total++; matrix++;
+            }
+          }
+        }
+      });
+
+      showLoadMsg(total ? `Loaded ${total} entries (${matrix} matrix, ${log} log).` : 'No Late/Call Out entries found.');
+      const info=document.getElementById('scanInfo'); info.textContent = total ? `Scanned sheets: ${wb.SheetNames.join(', ')}` : `Scanned sheets: ${wb.SheetNames.join(', ')}`;
+    }
+
+    // ---------- Build roster from workbook (visible rows only when possible) ----------
+    function rosterFromWorkbook(wb){
+      const names = new Set();
+
+      wb.SheetNames.forEach(sheetName=>{
+        const ws = wb.Sheets[sheetName];
+        if(!ws) return;
+
+        // A) Try matrix-style visible rows
+        const ref = ws['!ref'];
+        if (ref){
+          const range = XLSX.utils.decode_range(ref);
+          const hr = range.s.r;
+          const c0 = ws[XLSX.utils.encode_cell({r:hr, c:0})];
+          const c1 = ws[XLSX.utils.encode_cell({r:hr, c:1})];
+          const h0 = c0 ? String(c0.v||'').toLowerCase() : '';
+          const h1 = c1 ? String(c1.v||'').toLowerCase() : '';
+          if (h0.includes('first') && h1.includes('last')){
+            for(let r=hr+1; r<=range.e.r; r++){
+              const rowsMeta = ws['!rows'] || [];
+              const rowMeta = rowsMeta[r] || {};
+              if (rowMeta && rowMeta.hidden) continue; // honor hidden
+              const fn = ws[XLSX.utils.encode_cell({r, c:0})];
+              const ln = ws[XLSX.utils.encode_cell({r, c:1})];
+              const nm = `${(fn&&fn.v)||''} ${(ln&&ln.v)||''}`.trim();
+              if (nm) names.add(nm);
+            }
+            return; // this sheet handled; continue next
+          }
+        }
+
+        // B) Fallback: log-style names
+        const json = XLSX.utils.sheet_to_json(ws, {header:1, raw:true});
+        if(json && json.length){
+          const headers = json[0].map(h => String(h||'').toLowerCase());
+          let nameIdx = headers.indexOf('name');
+          if (nameIdx === -1) nameIdx = headers.indexOf('employee');
+          const firstIdx = headers.indexOf('first name');
+          const lastIdx = headers.indexOf('last name');
+          if (nameIdx !== -1 || (firstIdx !== -1 && lastIdx !== -1)){
+            for(let r=1;r<json.length;r++){
+              const row = json[r];
+              let nm = nameIdx !== -1 ? (row[nameIdx]||'') : `${row[firstIdx]||''} ${row[lastIdx]||''}`;
+              nm = String(nm||'').trim();
+              if (nm) names.add(nm);
+            }
+          }
+        }
+      });
+
+      return Array.from(names);
+    }
+
+    function refreshNamesFromWB(){
+      if (!lastWorkbook){ setRosterMsg('Upload a workbook first.'); return; }
+      const names = rosterFromWorkbook(lastWorkbook);
+      if (!names.length){ setRosterMsg('No names found in uploaded file.'); return; }
+      const before = Array.from(document.querySelectorAll('#nameSelect option')).map(o=>o.value).filter(Boolean);
+      buildNameDropdown(names, true);
+      const added = names.filter(n => !before.some(b=>canon(b)===canon(n)));
+      setRosterMsg(added.length ? `Added ${added.length} name(s) from uploaded file.` : `Names refreshed from uploaded file.`);
+    }
+
+    document.getElementById('refreshNamesBtn').addEventListener('click', refreshNamesFromWB);
+
+    // ---------- Filtering & rendering ----------
+    function filterEntries(name, startDate, showType){
+      const start=new Date(startDate); start.setHours(0,0,0,0);
+      const want = canon(name);
+      const rows=allRows.filter(r => canon(r.name)===want && r.date>=start && (showType==='both' || r.type.toLowerCase()===showType));
+      rows.sort((a,b)=>a.date-b.date);
+      return rows;
+    }
+
+    function renderRows(rows){
+      const tbody=document.getElementById('tbody'); tbody.innerHTML='';
+      rows.forEach(r=>{
+        const tr=document.createElement('tr');
+        const d=document.createElement('td'); d.className='px-3 py-2 whitespace-nowrap'; d.textContent=r.date.toLocaleDateString(); tr.appendChild(d);
+        const n=document.createElement('td'); n.className='px-3 py-2 whitespace-nowrap'; n.textContent=r.name; tr.appendChild(n);
+        const t=document.createElement('td'); t.className='px-3 py-2 whitespace-nowrap'; t.textContent=r.type; tr.appendChild(t);
+        const s=document.createElement('td'); s.className='px-3 py-2 whitespace-nowrap cell-rel';
+          const pill=document.createElement('span'); pill.className='badge clickable'; pill.textContent=r.type;
+          const tip=document.createElement('div'); tip.className='tooltip';
+          if(r.type==='Late'){
+            const parts=[];
+            if(r.mins!=null&&!isNaN(r.mins)) parts.push(`${r.mins} min`);
+            if(r.hrsExplicit && r.hrs!=null && !isNaN(r.hrs)) parts.push(`${r.hrs} hr`);
+            tip.textContent = parts.length ? parts.join(' • ') : 'No minutes/hours recorded';
+          } else { tip.textContent=r.status||'Call Out'; }
+          pill.addEventListener('click',()=>{ tip.style.display=(tip.style.display==='none'||tip.style.display==='')?'block':'none'; });
+          document.addEventListener('click',(ev)=>{ if(!s.contains(ev.target)) tip.style.display='none'; });
+          s.appendChild(pill); s.appendChild(tip); tr.appendChild(s);
+        const lm=document.createElement('td'); lm.className='px-3 py-2 whitespace-nowrap'; lm.textContent=(r.type==='Late'&&r.mins!=null&&!isNaN(r.mins))?r.mins:''; tr.appendChild(lm);
+        const lh=document.createElement('td'); lh.className='px-3 py-2 whitespace-nowrap';
+          lh.textContent=(r.type==='Late' && r.hrsExplicit && r.hrs!=null && !isNaN(r.hrs)) ? r.hrs : '';
+          tr.appendChild(lh);
+        tbody.appendChild(tr);
+      });
+    }
+
+    document.getElementById('fileInput').addEventListener('change', async (e)=>{
+      const file=e.target.files[0]; if(!file) return; showLoadMsg('Reading workbook (with comments)...');
+      try{
+        const data=await file.arrayBuffer();
+        const wb=XLSX.read(data,{type:'array', cellComments:true, cellDates:true});
+        readWorkbook(wb);
+        // Auto-refresh names from the file once on load
+        refreshNamesFromWB();
+      }catch(err){ console.error(err); showLoadMsg('Error reading Excel.', true); }
+    });
+
+    document.getElementById('runBtn').addEventListener('click', ()=>{
+      const name=document.getElementById('nameSelect').value;
+      const date=document.getElementById('dateSelect').value;
+      const showType=document.getElementById('typeSelect').value;
+      const summary=document.getElementById('summary');
+      if(!name || !date){ summary.textContent='Select a name and start date.'; return; }
+      const rows=filterEntries(name, date, showType);
+      const label=(showType==='both')?'Late/Call Out':(showType==='late'?'Late':'Call Out');
+      summary.textContent=rows.length?`${rows.length} ${label} entr${rows.length===1?'y':'ies'} for ${name} from ${new Date(date).toLocaleDateString()} onward.`:`No ${label.toLowerCase()} entries for ${name} from ${new Date(date).toLocaleDateString()} onward.`;
+      renderRows(rows);
+    });
+  </script>
+</body>
+</html>
